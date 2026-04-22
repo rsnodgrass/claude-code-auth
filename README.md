@@ -1,4 +1,4 @@
-# claude-auth
+# Claude Code Auth (cc-auth)
 
 `cc-auth` — save, switch, and inspect multiple Claude Code authentication slots.
 
