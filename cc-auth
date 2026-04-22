@@ -432,6 +432,15 @@ def cmd_list() -> None:
     if not names:
         print(_c(DIM, "(no slots saved)"))
         return
+    stale = [n for n in names
+             if not _usage_is_fresh(load_json(slot_dir(n) / "usage.json"))]
+    if stale:
+        msg = f"refreshing {len(stale)} slot{'s' if len(stale) != 1 else ''}…"
+        print(_c(DIM, msg), file=sys.stderr, flush=True)
+        for n in stale:
+            err = _refresh_slot(n)
+            if err:
+                print(_c(DIM, f"  {n}: {err}"), file=sys.stderr)
     current = find_current_slot()
     for n in names:
         print(_slot_picker_line(n, current, color=_color_enabled()))
@@ -455,25 +464,68 @@ def cmd_delete(name: str) -> None:
     print(f"Deleted slot: {name}")
 
 
+LIST_REFRESH_MAX_AGE_S = 15 * 60
+
+
+def _refresh_slot(name: str) -> str | None:
+    """Fetch fresh profile + usage for a slot; write to disk. Return err or None."""
+    blob = slot_creds_read(name)
+    if blob is None:
+        return "missing credentials"
+    token = extract_access_token(blob)
+    if not token:
+        return "no access token"
+    profile, usage, err = fetch_profile_and_usage(token)
+    d = slot_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    if profile is not None:
+        (d / "profile.json").write_text(json.dumps(profile, indent=2))
+    if usage is not None:
+        usage["_fetched_at"] = datetime.now(timezone.utc).isoformat()
+        (d / "usage.json").write_text(json.dumps(usage, indent=2))
+    return err
+
+
+def _usage_is_fresh(usage: dict | None, max_age_s: int = LIST_REFRESH_MAX_AGE_S) -> bool:
+    """Decide if cached usage avoids a refresh.
+
+    Fresh if either:
+      - it was fetched within max_age_s, OR
+      - a bucket is saturated (>=100%) with a future resets_at — utilization
+        can't change until that rollover, so re-polling is wasted.
+    """
+    if not usage:
+        return False
+    now = datetime.now(timezone.utc)
+    fetched = usage.get("_fetched_at")
+    if fetched:
+        try:
+            dt = datetime.fromisoformat(fetched.replace("Z", "+00:00"))
+            if (now - dt).total_seconds() < max_age_s:
+                return True
+        except ValueError:
+            pass
+    for key in ("five_hour", "seven_day"):
+        block = usage.get(key) or {}
+        pct = block.get("utilization")
+        resets = block.get("resets_at")
+        if not (isinstance(pct, (int, float)) and pct >= 100 and resets):
+            continue
+        try:
+            reset_dt = datetime.fromisoformat(resets.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if reset_dt > now:
+            return True
+    return False
+
+
 def cmd_refresh(name: str | None) -> None:
     names = [name] if name else list_slot_names()
     if not names:
         die("No slots to refresh.")
     for n in names:
-        blob = slot_creds_read(n)
-        if blob is None:
-            print(f"{n}: missing credentials, skipping", file=sys.stderr)
-            continue
-        token = extract_access_token(blob)
-        if not token:
-            print(f"{n}: no access token", file=sys.stderr)
-            continue
-        profile, usage, err = fetch_profile_and_usage(token)
-        if profile is not None:
-            (slot_dir(n) / "profile.json").write_text(json.dumps(profile, indent=2))
-        if usage is not None:
-            usage["_fetched_at"] = datetime.now(timezone.utc).isoformat()
-            (slot_dir(n) / "usage.json").write_text(json.dumps(usage, indent=2))
+        err = _refresh_slot(n)
         status = "ok" if err is None else f"WARN {err}"
         print(f"{n}: {status}")
 
