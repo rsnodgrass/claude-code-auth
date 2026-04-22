@@ -357,7 +357,15 @@ def _slot_picker_line(n: str, current: str | None, *, color: bool = False) -> st
     sd_bar = sparkbar(sd_pct, 10, force_color=color)
     fh_pct_s = color_pct(fh_pct, force_color=color)
     sd_pct_s = color_pct(sd_pct, force_color=color)
-    reset_s = color_reset_hint(fh.get("resets_at"), force_color=color)
+    # show the reset for whichever bucket is actually blocking capacity: if
+    # the 7d window is saturated (or the 5h window has no active reset), the
+    # 5h reset is meaningless — the 7d rollover is when the account returns.
+    binding_is_sd = (
+        (isinstance(sd_pct, (int, float)) and sd_pct >= 100)
+        or not fh.get("resets_at")
+    )
+    reset_iso = sd.get("resets_at") if binding_is_sd else fh.get("resets_at")
+    reset_s = color_reset_hint(reset_iso, force_color=color)
 
     lbl_5h = _c(LABEL, "5h", force=color) if color else "5h"
     lbl_7d = _c(LABEL, "7d", force=color) if color else "7d"
@@ -375,20 +383,19 @@ def pick_slot_interactively() -> str | None:
         die("No slots saved.")
     current = find_current_slot()
     if shutil.which("fzf") and sys.stdin.isatty():
-        lines = [_slot_picker_line(n, current, color=True) for n in names]
+        # prepend raw slot name as a hidden tab-delimited field so parsing the
+        # selection doesn't depend on the visible marker/whitespace layout.
+        lines = [f"{n}\t{_slot_picker_line(n, current, color=True)}" for n in names]
         header = _c(LABEL, f"  {'slot':<26}  {'tier':<10}  "
                            f"{'5h utilization':<18}   {'7d utilization':<18}   resets", force=True)
         r = subprocess.run(
             ["fzf", "--ansi", "--prompt=switch to> ", "--height=40%", "--reverse",
-             "--header=" + header, "--with-nth=1.."],
+             "--header=" + header, "--delimiter=\t", "--with-nth=2..", "--nth=2.."],
             input="\n".join(lines), capture_output=True, text=True,
         )
         if r.returncode != 0 or not r.stdout.strip():
             return None
-        # strip ANSI then grab the slot name (2nd whitespace field after marker)
-        import re
-        plain = re.sub(r"\033\[[0-9;]*m", "", r.stdout.strip())
-        return plain.split()[1]
+        return r.stdout.split("\t", 1)[0]
 
     # fallback: numbered stdin prompt (plain, works anywhere)
     lines = [_slot_picker_line(n, current, color=_color_enabled()) for n in names]
