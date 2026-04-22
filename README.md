@@ -70,15 +70,6 @@ The only files `cc-auth` writes under `~/.cc-auth/slots/<name>/` are `profile.js
 
 The only network calls are authenticated `GET`s to `api.anthropic.com/api/oauth/profile` and `/api/oauth/usage`. No third-party services, no telemetry.
 
-### Migrating from older `cc-auth`
-
-Earlier versions stored slot credentials as `~/.cc-auth/slots/<name>/credentials.json` on macOS too. On first read, `cc-auth` transparently moves each legacy file into the Keychain and deletes the on-disk copy — no action required.
-
-## Environment
-
-- `NO_COLOR` — disables ANSI color output
-- `CC_AUTH_FORCE_COLOR` — forces color even when stdout is not a TTY
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
