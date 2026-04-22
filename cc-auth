@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""cc-auth — save/switch/inspect Claude Code auth slots.
+
+Storage:
+  - credentials: macOS Keychain (service "cc-auth", account = slot name);
+                 on Linux, ~/.cc-auth/slots/<name>/credentials.json (chmod 600)
+  - ~/.cc-auth/slots/<name>/profile.json: last response from /api/oauth/profile
+  - ~/.cc-auth/slots/<name>/usage.json:   last response from /api/oauth/usage
+                                          (with _fetched_at added)
+
+Usage:
+  cc-auth save [<name>]       snapshot active credentials, fetch profile+usage
+                              (name defaults to the logged-in account email)
+  cc-auth switch [<name>]     write slot credentials back into keychain / creds file
+                              (no name → fzf picker, or numbered prompt as fallback)
+  cc-auth list                list slots with cached email + tier
+  cc-auth current             name of the slot matching active credentials (if any)
+  cc-auth delete <name>       remove a slot
+  cc-auth refresh [<name>]    re-fetch profile+usage for one slot (or all)
+  cc-auth stats [<name>]      table of cached usage per slot (or one)
+  cc-auth whoami              active account email+tier (from fresh profile call)
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+KEYCHAIN_ACCOUNT = os.environ.get("USER", "")
+LINUX_CREDS_FILE = Path.home() / ".claude" / ".credentials.json"
+
+SLOT_KEYCHAIN_SERVICE = "cc-auth"
+
+CC_HOME = Path.home() / ".cc-auth"
+SLOTS_DIR = CC_HOME / "slots"
+
+API_BASE = "https://api.anthropic.com"
+OAUTH_BETA = "oauth-2025-04-20"
+
+
+# ─── color + visual helpers (Tufte-ish: muted palette, data-ink ratio) ─────
+# Respect NO_COLOR and non-TTY. 256-color ANSI for muted semantic palette.
+
+def _color_enabled(stream=sys.stdout) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("CC_AUTH_FORCE_COLOR"):
+        return True
+    return hasattr(stream, "isatty") and stream.isatty()
+
+
+def _c(code: str, s: str, *, force: bool = False) -> str:
+    if not (force or _color_enabled()):
+        return s
+    return f"\033[{code}m{s}\033[0m"
+
+# muted palette (xterm-256)
+SAGE, AMBER, BRICK, DIM, LABEL, ACCENT = "38;5;108", "38;5;179", "38;5;167", "38;5;244", "38;5;250", "38;5;111"
+BOLD = "1"
+
+
+def severity_code(pct: float | None) -> str:
+    if pct is None:
+        return DIM
+    if pct < 50:
+        return SAGE
+    if pct < 80:
+        return AMBER
+    return BRICK
+
+
+def sparkbar(pct: float | None, width: int = 10, *, force_color: bool = False) -> str:
+    """Horizontal sparkbar using eighth blocks for sub-cell precision."""
+    blocks = " ▏▎▍▌▋▊▉█"  # 0..8 eighths
+    if pct is None:
+        body = "·" * width
+        return _c(DIM, body, force=force_color)
+    p = max(0.0, min(100.0, float(pct)))
+    eighths = round(p / 100.0 * width * 8)
+    full, rem = divmod(eighths, 8)
+    body = "█" * full
+    if rem:
+        body += blocks[rem]
+    body = body.ljust(width, "·")
+    return _c(severity_code(p), body, force=force_color)
+
+
+def color_pct(pct: float | None, *, force_color: bool = False) -> str:
+    if pct is None:
+        return _c(DIM, "    -", force=force_color)
+    return _c(severity_code(pct), f"{pct:>4.0f}%", force=force_color)
+
+
+def _clock(dt_local: datetime) -> str:
+    """'5pm', '5:30pm', or 'Fri 5pm' for >24h out."""
+    h12 = dt_local.strftime("%-I")
+    ampm = dt_local.strftime("%p").lower()
+    t = f"{h12}{ampm}" if dt_local.minute == 0 else f"{h12}:{dt_local.minute:02d}{ampm}"
+    return t
+
+
+def color_reset_hint(iso: str | None, *, force_color: bool = False) -> str:
+    """Return coloured hint like '3.0h @ 5pm' / '2.8d @ Fri 5pm' / 'expired'."""
+    if not iso:
+        return _c(DIM, "—", force=force_color)
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return iso
+    hours = (dt - datetime.now(timezone.utc)).total_seconds() / 3600
+    if hours < 0:
+        return _c(BRICK, "expired", force=force_color)
+    local = dt.astimezone()
+    if hours < 24:
+        rel = f"{hours:>4.1f}h"
+        clock = _clock(local)
+    else:
+        rel = f"{hours/24:>4.1f}d"
+        clock = f"{local.strftime('%a')} {_clock(local)}"
+    # sooner = warmer. <1h red, <6h amber, else sage.
+    code = BRICK if hours < 1 else AMBER if hours < 6 else SAGE
+    return _c(code, rel, force=force_color) + _c(DIM, f" @ {clock}", force=force_color)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# ─── credential store (keychain on macOS, file on Linux) ───────────────────
+
+def read_active_credentials() -> str | None:
+    """Return raw credentials JSON string, or None if missing."""
+    if sys.platform == "darwin":
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True,
+        )
+        return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    if LINUX_CREDS_FILE.is_file():
+        return LINUX_CREDS_FILE.read_text()
+    return None
+
+
+def write_active_credentials(blob: str) -> None:
+    if sys.platform == "darwin":
+        subprocess.run(
+            ["security", "add-generic-password", "-U",
+             "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w", blob],
+            check=True,
+        )
+        return
+    LINUX_CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LINUX_CREDS_FILE.write_text(blob)
+    os.chmod(LINUX_CREDS_FILE, 0o600)
+
+
+def extract_access_token(blob: str) -> str | None:
+    try:
+        return json.loads(blob)["claudeAiOauth"]["accessToken"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+# ─── API calls ─────────────────────────────────────────────────────────────
+
+def api_get(path: str, token: str) -> dict:
+    req = urllib.request.Request(
+        API_BASE + path,
+        headers={"Authorization": f"Bearer {token}", "anthropic-beta": OAUTH_BETA},
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def fetch_profile_and_usage(token: str) -> tuple[dict | None, dict | None, str | None]:
+    try:
+        profile = api_get("/api/oauth/profile", token)
+    except urllib.error.HTTPError as e:
+        return None, None, f"profile: HTTP {e.code} {e.reason}"
+    except Exception as e:
+        return None, None, f"profile: {e}"
+    try:
+        usage = api_get("/api/oauth/usage", token)
+    except urllib.error.HTTPError as e:
+        return profile, None, f"usage: HTTP {e.code} {e.reason}"
+    except Exception as e:
+        return profile, None, f"usage: {e}"
+    return profile, usage, None
+
+
+# ─── slot storage ──────────────────────────────────────────────────────────
+
+def slot_dir(name: str) -> Path:
+    return SLOTS_DIR / name
+
+
+def list_slot_names() -> list[str]:
+    if not SLOTS_DIR.is_dir():
+        return []
+    return sorted(p.name for p in SLOTS_DIR.iterdir() if p.is_dir())
+
+
+# ─── per-slot credential storage (Keychain on macOS, file on Linux) ────────
+# Slots avoid leaving plaintext OAuth tokens on disk on macOS by storing each
+# blob in the login Keychain under service "cc-auth", account = slot name.
+# Linux falls back to a chmod-600 file (no system-wide secret store assumed).
+
+def slot_creds_read(name: str) -> str | None:
+    if sys.platform == "darwin":
+        r = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", SLOT_KEYCHAIN_SERVICE, "-a", name, "-w"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+        # one-shot migration: legacy on-disk slot → keychain, then remove file
+        legacy = slot_dir(name) / "credentials.json"
+        if legacy.is_file():
+            blob = legacy.read_text()
+            slot_creds_write(name, blob)
+            try:
+                legacy.unlink()
+            except OSError:
+                pass
+            return blob
+        return None
+    legacy = slot_dir(name) / "credentials.json"
+    return legacy.read_text() if legacy.is_file() else None
+
+
+def slot_creds_write(name: str, blob: str) -> None:
+    if sys.platform == "darwin":
+        subprocess.run(
+            ["security", "add-generic-password", "-U",
+             "-s", SLOT_KEYCHAIN_SERVICE, "-a", name, "-w", blob],
+            check=True,
+        )
+        return
+    f = slot_dir(name) / "credentials.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(blob)
+    os.chmod(f, 0o600)
+
+
+def slot_creds_delete(name: str) -> None:
+    if sys.platform == "darwin":
+        subprocess.run(
+            ["security", "delete-generic-password",
+             "-s", SLOT_KEYCHAIN_SERVICE, "-a", name],
+            capture_output=True,
+        )
+    legacy = slot_dir(name) / "credentials.json"
+    if legacy.is_file():
+        try:
+            legacy.unlink()
+        except OSError:
+            pass
+
+
+def load_json(p: Path) -> dict | None:
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def save_slot(name: str, blob: str, refresh: bool = True) -> None:
+    d = slot_dir(name)
+    d.mkdir(parents=True, exist_ok=True)  # holds profile.json / usage.json (non-secret)
+    slot_creds_write(name, blob)
+
+    if not refresh:
+        return
+    token = extract_access_token(blob)
+    if not token:
+        print(f"  warning: no access token in blob for {name}", file=sys.stderr)
+        return
+    profile, usage, err = fetch_profile_and_usage(token)
+    if profile is not None:
+        (d / "profile.json").write_text(json.dumps(profile, indent=2))
+    if usage is not None:
+        usage["_fetched_at"] = datetime.now(timezone.utc).isoformat()
+        (d / "usage.json").write_text(json.dumps(usage, indent=2))
+    if err:
+        print(f"  warning: {err}", file=sys.stderr)
+
+
+def slot_email(name: str) -> str:
+    prof = load_json(slot_dir(name) / "profile.json")
+    if prof:
+        return prof.get("account", {}).get("email", "") or ""
+    return ""
+
+
+def slot_tier(name: str) -> str:
+    prof = load_json(slot_dir(name) / "profile.json")
+    if prof:
+        return prof.get("organization", {}).get("rate_limit_tier", "") or ""
+    return ""
+
+
+def find_current_slot() -> str | None:
+    active = read_active_credentials()
+    if not active:
+        return None
+    active_tok = extract_access_token(active)
+    if not active_tok:
+        return None
+    for name in list_slot_names():
+        blob = slot_creds_read(name)
+        if blob and extract_access_token(blob) == active_tok:
+            return name
+    return None
+
+
+# ─── commands ──────────────────────────────────────────────────────────────
+
+def cmd_save(name: str | None) -> None:
+    blob = read_active_credentials()
+    if not blob:
+        die("No active Claude credentials found. Log in with `claude` first.")
+    if not name:
+        token = extract_access_token(blob)
+        profile, _, err = fetch_profile_and_usage(token) if token else (None, None, "no token")
+        email = (profile or {}).get("account", {}).get("email") if profile else None
+        if not email:
+            die(f"Could not auto-detect email for default slot name ({err or 'no email in profile'}). Pass a name explicitly.")
+        name = email
+    save_slot(name, blob)
+    print(f"Saved slot: {name}  ({slot_email(name) or 'email unknown'}, {slot_tier(name) or 'tier unknown'})")
+
+
+def _slot_picker_line(n: str, current: str | None, *, color: bool = False) -> str:
+    usage = load_json(slot_dir(n) / "usage.json") or {}
+    fh = usage.get("five_hour") or {}
+    sd = usage.get("seven_day") or {}
+    tier = (slot_tier(n) or "-").replace("default_claude_", "").replace("_", " ")
+    marker = "●" if n == current else " "
+    marker_s = _c(ACCENT, marker, force=color) if color else marker
+    name_s = _c(BOLD, f"{n:<26.26}", force=color) if color else f"{n:<26.26}"
+    tier_s = _c(LABEL, f"{tier:<10.10}", force=color) if color else f"{tier:<10.10}"
+
+    fh_pct = fh.get("utilization")
+    sd_pct = sd.get("utilization")
+    fh_bar = sparkbar(fh_pct, 10, force_color=color)
+    sd_bar = sparkbar(sd_pct, 10, force_color=color)
+    fh_pct_s = color_pct(fh_pct, force_color=color)
+    sd_pct_s = color_pct(sd_pct, force_color=color)
+    reset_s = color_reset_hint(fh.get("resets_at"), force_color=color)
+
+    lbl_5h = _c(LABEL, "5h", force=color) if color else "5h"
+    lbl_7d = _c(LABEL, "7d", force=color) if color else "7d"
+    lbl_rs = _c(LABEL, "↻", force=color) if color else "resets"
+
+    return (f"{marker_s} {name_s}  {tier_s}  "
+            f"{lbl_5h} {fh_bar} {fh_pct_s}   "
+            f"{lbl_7d} {sd_bar} {sd_pct_s}   "
+            f"{lbl_rs} {reset_s}")
+
+
+def pick_slot_interactively() -> str | None:
+    names = list_slot_names()
+    if not names:
+        die("No slots saved.")
+    current = find_current_slot()
+    if shutil.which("fzf") and sys.stdin.isatty():
+        lines = [_slot_picker_line(n, current, color=True) for n in names]
+        header = _c(LABEL, f"  {'slot':<26}  {'tier':<10}  "
+                           f"{'5h utilization':<18}   {'7d utilization':<18}   resets", force=True)
+        r = subprocess.run(
+            ["fzf", "--ansi", "--prompt=switch to> ", "--height=40%", "--reverse",
+             "--header=" + header, "--with-nth=1.."],
+            input="\n".join(lines), capture_output=True, text=True,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        # strip ANSI then grab the slot name (2nd whitespace field after marker)
+        import re
+        plain = re.sub(r"\033\[[0-9;]*m", "", r.stdout.strip())
+        return plain.split()[1]
+
+    # fallback: numbered stdin prompt (plain, works anywhere)
+    lines = [_slot_picker_line(n, current, color=_color_enabled()) for n in names]
+    print(_c(LABEL, "Saved slots:"))
+    for i, line in enumerate(lines, 1):
+        print(f"  {i:>2}) {line}")
+    try:
+        choice = input("pick number (or blank to cancel)> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not choice:
+        return None
+    if not choice.isdigit() or not (1 <= int(choice) <= len(names)):
+        die(f"Invalid selection: {choice}")
+    return names[int(choice) - 1]
+
+
+def cmd_switch(name: str | None) -> None:
+    if not name:
+        name = pick_slot_interactively()
+        if not name:
+            print("(cancelled)")
+            return
+    blob = slot_creds_read(name)
+    if blob is None:
+        die(f"No such slot: {name}")
+    write_active_credentials(blob)
+    print(f"Switched to slot: {name}  ({slot_email(name) or 'email unknown'})")
+    print("Restart Claude Code sessions to pick up the change.")
+
+
+def cmd_list() -> None:
+    names = list_slot_names()
+    if not names:
+        print(_c(DIM, "(no slots saved)"))
+        return
+    current = find_current_slot()
+    for n in names:
+        print(_slot_picker_line(n, current, color=_color_enabled()))
+
+
+def cmd_current() -> None:
+    n = find_current_slot()
+    if n:
+        print(n)
+    else:
+        die("No saved slot matches active credentials.")
+
+
+def cmd_delete(name: str) -> None:
+    d = slot_dir(name)
+    if not d.is_dir() and slot_creds_read(name) is None:
+        die(f"No such slot: {name}")
+    slot_creds_delete(name)
+    if d.is_dir():
+        shutil.rmtree(d)
+    print(f"Deleted slot: {name}")
+
+
+def cmd_refresh(name: str | None) -> None:
+    names = [name] if name else list_slot_names()
+    if not names:
+        die("No slots to refresh.")
+    for n in names:
+        blob = slot_creds_read(n)
+        if blob is None:
+            print(f"{n}: missing credentials, skipping", file=sys.stderr)
+            continue
+        token = extract_access_token(blob)
+        if not token:
+            print(f"{n}: no access token", file=sys.stderr)
+            continue
+        profile, usage, err = fetch_profile_and_usage(token)
+        if profile is not None:
+            (slot_dir(n) / "profile.json").write_text(json.dumps(profile, indent=2))
+        if usage is not None:
+            usage["_fetched_at"] = datetime.now(timezone.utc).isoformat()
+            (slot_dir(n) / "usage.json").write_text(json.dumps(usage, indent=2))
+        status = "ok" if err is None else f"WARN {err}"
+        print(f"{n}: {status}")
+
+
+def _fmt_util(block: dict | None) -> str:
+    if not block:
+        return "-"
+    u = block.get("utilization")
+    return f"{u:>5.1f}%" if isinstance(u, (int, float)) else "-"
+
+
+def _fmt_reset(iso: str | None) -> str:
+    if not iso:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        delta = dt - datetime.now(timezone.utc)
+        hours = delta.total_seconds() / 3600
+        if hours < 0:
+            return "expired"
+        if hours < 24:
+            return f"in {hours:.1f}h"
+        return f"in {hours/24:.1f}d"
+    except ValueError:
+        return iso
+
+
+def cmd_stats(name: str | None) -> None:
+    names = [name] if name else list_slot_names()
+    if not names:
+        die("No slots saved.")
+    current = find_current_slot()
+    color = _color_enabled()
+
+    def row(label: str, pct: float | None, resets: str | None) -> str:
+        return (f"    {_c(LABEL, f'{label:<10}', force=color)}  "
+                f"{sparkbar(pct, 20, force_color=color)}  "
+                f"{color_pct(pct, force_color=color)}   "
+                f"{_c(LABEL, 'resets', force=color)} "
+                f"{color_reset_hint(resets, force_color=color)}")
+
+    for i, n in enumerate(names):
+        if i:
+            print()
+        prof = load_json(slot_dir(n) / "profile.json") or {}
+        usage = load_json(slot_dir(n) / "usage.json") or {}
+        email = prof.get("account", {}).get("email", "-")
+        tier = (prof.get("organization", {}).get("rate_limit_tier") or "-") \
+            .replace("default_claude_", "").replace("_", " ")
+        marker = "●" if n == current else "○"
+        marker_s = _c(ACCENT if n == current else DIM, marker, force=color)
+        name_s = _c(BOLD, n, force=color)
+        meta_s = _c(DIM, f"{email}  ·  {tier}", force=color)
+        print(f"{marker_s} {name_s}   {meta_s}")
+
+        fh = usage.get("five_hour") or {}
+        sd = usage.get("seven_day") or {}
+        opus = usage.get("seven_day_opus") or {}
+        sonn = usage.get("seven_day_sonnet") or {}
+
+        print(row("5 hour", fh.get("utilization"), fh.get("resets_at")))
+        print(row("7 day",  sd.get("utilization"), sd.get("resets_at")))
+        if opus:
+            print(row("  opus",   opus.get("utilization"), opus.get("resets_at")))
+        if sonn:
+            print(row("  sonnet", sonn.get("utilization"), sonn.get("resets_at")))
+
+        fetched = usage.get("_fetched_at")
+        if fetched:
+            try:
+                dt = datetime.fromisoformat(fetched.replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - dt).total_seconds() / 60
+                age_s = f"{age:.0f}m ago" if age < 60 else f"{age/60:.1f}h ago"
+            except ValueError:
+                age_s = fetched
+            print(f"    {_c(DIM, f'updated {age_s}', force=color)}")
+
+
+def cmd_whoami() -> None:
+    blob = read_active_credentials()
+    if not blob:
+        die("No active credentials.")
+    token = extract_access_token(blob)
+    if not token:
+        die("Could not parse access token from credentials.")
+    profile, usage, err = fetch_profile_and_usage(token)
+    if err and profile is None:
+        die(f"Profile fetch failed: {err}")
+    color = _color_enabled()
+    acct = profile.get("account", {})
+    org = profile.get("organization", {})
+    def kv(k, v):
+        return f"  {_c(LABEL, f'{k:<7}', force=color)} {v}"
+    print(kv("email",  _c(BOLD, acct.get("email", "?"), force=color)))
+    print(kv("name",   acct.get("full_name", "?")))
+    print(kv("tier",   (org.get("rate_limit_tier") or "?").replace("default_claude_", "")))
+    print(kv("plan",   f"max={acct.get('has_claude_max')} pro={acct.get('has_claude_pro')}"))
+    if usage:
+        fh = usage.get("five_hour") or {}
+        sd = usage.get("seven_day") or {}
+        def row(label, pct, resets):
+            return (f"  {_c(LABEL, f'{label:<7}', force=color)} "
+                    f"{sparkbar(pct, 20, force_color=color)}  "
+                    f"{color_pct(pct, force_color=color)}   "
+                    f"{_c(LABEL, 'resets', force=color)} "
+                    f"{color_reset_hint(resets, force_color=color)}")
+        print()
+        print(row("5 hour", fh.get("utilization"), fh.get("resets_at")))
+        print(row("7 day",  sd.get("utilization"), sd.get("resets_at")))
+
+
+# ─── main ──────────────────────────────────────────────────────────────────
+
+COMMANDS = {
+    "save": (cmd_save, "0-1"),
+    "switch": (cmd_switch, "0-1"),
+    "list": (cmd_list, 0),
+    "current": (cmd_current, 0),
+    "delete": (cmd_delete, 1),
+    "refresh": (cmd_refresh, "0-1"),
+    "stats": (cmd_stats, "0-1"),
+    "whoami": (cmd_whoami, 0),
+}
+
+
+def main() -> None:
+    SLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd = argv[0]
+    args = argv[1:]
+    if cmd not in COMMANDS:
+        die(f"Unknown command: {cmd}\n\n{__doc__}")
+    fn, arity = COMMANDS[cmd]
+    if arity == 0:
+        if args:
+            die(f"{cmd} takes no arguments")
+        fn()
+    elif arity == 1:
+        if len(args) != 1:
+            die(f"{cmd} requires exactly one argument")
+        fn(args[0])
+    elif arity == "0-1":
+        if len(args) > 1:
+            die(f"{cmd} takes at most one argument")
+        fn(args[0] if args else None)
+
+
+if __name__ == "__main__":
+    main()
