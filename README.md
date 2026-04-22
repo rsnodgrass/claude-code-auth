@@ -4,21 +4,25 @@
 
 If you use more than one Claude account (personal/work, multiple Max plans, a shared org login), Claude Code only ever sees one set of credentials at a time. `cc-auth` snapshots those credentials into named slots and lets you swap between them, while caching each account's profile and rate-limit usage so you can see — at a glance — which account has headroom left.
 
+![cc-auth list example](docs/cc-auth-list-example.png)
+
 ## How it works
 
 Claude Code stores its OAuth credentials in:
 
 - **macOS**: the login Keychain, under service `Claude Code-credentials`
-- **Linux**: `~/.claude/.credentials.json`
+- **Linux**: `~/.claude/.credentials.json` (chmod 600)
 
-`cc-auth` reads/writes that one active location and keeps per-account copies under `~/.cc-auth/slots/<name>/`:
+**Credentials are never written to `~/.claude/cc-auth/`.** On macOS, every slot's OAuth blob is stored **securely in the login Keychain** (service `cc-auth`, account = slot name) — encrypted at rest under your login password, gated by the system `security` binary, and never touches disk in plaintext. On Linux, where there's no system-wide secret store to assume, slot credentials live in `credentials.json` files written `chmod 600`.
+
+The only things `cc-auth` writes under `~/.claude/cc-auth/slots/<name>/` are **non-sensitive metadata** used for the `list` / `stats` views:
 
 - `profile.json` — last response from `/api/oauth/profile` (email, tier, plan)
 - `usage.json` — last response from `/api/oauth/usage` (5h / 7d utilization, reset times)
 
-The actual OAuth credentials are stored separately — in the macOS login Keychain (service `cc-auth`, account = slot name), or in `credentials.json` alongside the metadata on Linux. See [Security](#security) for details.
+Switching a slot copies its credentials back into the active location (Keychain on macOS, file on Linux). Restart any running Claude Code sessions to pick up the change.
 
-Switching a slot just writes its `credentials.json` back into the active location. Restart any running Claude Code sessions to pick up the change.
+> Upgrading from an older version? If you have a `~/.cc-auth/` directory from a prior install, `cc-auth` will automatically move it to `~/.claude/cc-auth/` on first run.
 
 ## Install
 
@@ -64,9 +68,9 @@ cc-auth switch
 `cc-auth` never sends your credentials anywhere. Tokens only move between two stores on your own machine:
 
 - **macOS**: every credential — both the *active* one Claude Code reads (service `Claude Code-credentials`) and every saved *slot* (service `cc-auth`, account = slot name) — lives in the login Keychain. Reads and writes go through the system `security` binary, so the OS prompts for Keychain access the first time and secrets are encrypted at rest under your login password. No OAuth tokens are ever written to disk by `cc-auth` on macOS.
-- **Linux**: the active credential is `~/.claude/.credentials.json` and slot credentials are `~/.cc-auth/slots/<name>/credentials.json`, both written `chmod 600`. There's no system-wide secret store assumed; if you need stronger isolation, run on an encrypted volume (LUKS) or wrap with `pass`/`secret-tool`.
+- **Linux**: the active credential is `~/.claude/.credentials.json` and slot credentials are `~/.claude/cc-auth/slots/<name>/credentials.json`, both written `chmod 600`. There's no system-wide secret store assumed; if you need stronger isolation, run on an encrypted volume (LUKS) or wrap with `pass`/`secret-tool`.
 
-The only files `cc-auth` writes under `~/.cc-auth/slots/<name>/` are `profile.json` and `usage.json` — non-sensitive metadata (email, tier, rate-limit counters) used for the `list` / `stats` views.
+The only files `cc-auth` writes under `~/.claude/cc-auth/slots/<name>/` are `profile.json` and `usage.json` — non-sensitive metadata (email, tier, rate-limit counters) used for the `list` / `stats` views.
 
 The only network calls are authenticated `GET`s to `api.anthropic.com/api/oauth/profile` and `/api/oauth/usage`. No third-party services, no telemetry.
 
