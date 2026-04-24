@@ -45,6 +45,16 @@ LEGACY_CC_HOME = Path.home() / ".cc-auth"  # pre-move location; migrated on firs
 API_BASE = "https://api.anthropic.com"
 OAUTH_BETA = "oauth-2025-04-20"
 
+# OAuth token refresh — Claude Code's public client id + token endpoint.
+# Cloudflare in front of console.anthropic.com 403s the stock urllib UA, so
+# every request to these hosts needs an explicit User-Agent.
+OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+USER_AGENT = "cc-auth/1.0"
+
+# refresh proactively if the token expires within this many seconds
+REFRESH_SKEW_S = 60
+
 
 # ─── color + visual helpers (Tufte-ish: muted palette, data-ink ratio) ─────
 # Respect NO_COLOR and non-TTY. 256-color ANSI for muted semantic palette.
@@ -170,15 +180,92 @@ def extract_access_token(blob: str) -> str | None:
         return None
 
 
+def token_expires_at(blob: str) -> int | None:
+    """Return expiresAt (unix ms) from a credentials blob, or None."""
+    try:
+        return int(json.loads(blob)["claudeAiOauth"]["expiresAt"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def token_is_expired(blob: str, skew_s: int = REFRESH_SKEW_S) -> bool:
+    exp_ms = token_expires_at(blob)
+    if exp_ms is None:
+        return False  # unknown → let the API call decide
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    return exp_ms - (skew_s * 1000) <= now_ms
+
+
 # ─── API calls ─────────────────────────────────────────────────────────────
 
 def api_get(path: str, token: str) -> dict:
     req = urllib.request.Request(
         API_BASE + path,
-        headers={"Authorization": f"Bearer {token}", "anthropic-beta": OAUTH_BETA},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": OAUTH_BETA,
+            "User-Agent": USER_AGENT,
+        },
     )
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())
+
+
+def refresh_blob(blob: str) -> tuple[str | None, str | None]:
+    """Exchange the refresh_token for a fresh access_token.
+
+    Returns (new_blob_json, error). The new blob preserves scopes/subscription
+    metadata from the old blob and updates accessToken, refreshToken, expiresAt
+    from the token endpoint. The server rotates refresh_token on each call.
+    """
+    try:
+        old = json.loads(blob)
+        refresh = old["claudeAiOauth"]["refreshToken"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None, "credentials blob missing refreshToken"
+
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL,
+        data=json.dumps({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": OAUTH_CLIENT_ID,
+        }).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode()[:200]
+        except Exception:
+            pass
+        return None, f"refresh: HTTP {e.code} {e.reason} {body}".strip()
+    except Exception as e:
+        return None, f"refresh: {e}"
+
+    access = resp.get("access_token")
+    new_refresh = resp.get("refresh_token", refresh)
+    expires_in = int(resp.get("expires_in") or 0)
+    if not access:
+        return None, "refresh: response missing access_token"
+
+    expires_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000) + expires_in * 1000
+    oauth = dict(old.get("claudeAiOauth", {}))
+    oauth["accessToken"] = access
+    oauth["refreshToken"] = new_refresh
+    oauth["expiresAt"] = expires_at_ms
+    # scopes come back space-delimited on refresh; preserve original list shape
+    new = dict(old)
+    new["claudeAiOauth"] = oauth
+    return json.dumps(new), None
 
 
 def fetch_profile_and_usage(token: str) -> tuple[dict | None, dict | None, str | None]:
@@ -354,6 +441,11 @@ def _slot_picker_line(n: str, current: str | None, *, color: bool = False) -> st
 
     fh_pct = fh.get("utilization")
     sd_pct = sd.get("utilization")
+    # 7d is the hard ceiling: when it's saturated you can't spend 5h capacity
+    # either, so show the 5h bar as tapped out rather than whatever residual
+    # fraction it held at rollover.
+    if isinstance(sd_pct, (int, float)) and sd_pct >= 100:
+        fh_pct = 100
     fh_bar = sparkbar(fh_pct, 10, force_color=color)
     sd_bar = sparkbar(sd_pct, 10, force_color=color)
     fh_pct_s = color_pct(fh_pct, force_color=color)
@@ -468,15 +560,63 @@ def cmd_delete(name: str) -> None:
 LIST_REFRESH_MAX_AGE_S = 15 * 60
 
 
+def _maybe_refresh_credentials(name: str, blob: str) -> tuple[str, str | None]:
+    """If the slot's access token is expired, refresh and persist the new blob.
+
+    Also syncs active credentials when the slot matched the currently-active
+    login, so the running `claude` picks up the rotated token without a manual
+    `cc-auth switch`. Returns (blob_to_use, err). On refresh failure, the old
+    blob is returned so downstream calls still get attempted (and surface their
+    own 401 if the token is truly dead).
+    """
+    if not token_is_expired(blob):
+        return blob, None
+    active_before = read_active_credentials()
+    was_active = (
+        active_before is not None
+        and extract_access_token(active_before) == extract_access_token(blob)
+    )
+    new_blob, err = refresh_blob(blob)
+    if err or new_blob is None:
+        return blob, err
+    slot_creds_write(name, new_blob)
+    if was_active:
+        write_active_credentials(new_blob)
+    return new_blob, None
+
+
 def _refresh_slot(name: str) -> str | None:
-    """Fetch fresh profile + usage for a slot; write to disk. Return err or None."""
+    """Fetch fresh profile + usage for a slot; write to disk. Return err or None.
+
+    Transparently refreshes the OAuth access token if it's expired (or about
+    to expire), and retries once on 401 in case expiry is wrong or the server
+    rejected the token early.
+    """
     blob = slot_creds_read(name)
     if blob is None:
         return "missing credentials"
+
+    blob, refresh_err = _maybe_refresh_credentials(name, blob)
     token = extract_access_token(blob)
     if not token:
-        return "no access token"
+        return refresh_err or "no access token"
+
     profile, usage, err = fetch_profile_and_usage(token)
+
+    # server rejected despite our expiry check — try one forced refresh + retry
+    if err and "401" in err and refresh_err is None:
+        new_blob, rerr = refresh_blob(blob)
+        if new_blob is not None:
+            slot_creds_write(name, new_blob)
+            active = read_active_credentials()
+            if active and extract_access_token(active) == token:
+                write_active_credentials(new_blob)
+            token = extract_access_token(new_blob)
+            if token:
+                profile, usage, err = fetch_profile_and_usage(token)
+        elif rerr:
+            err = f"{err}; {rerr}"
+
     d = slot_dir(name)
     d.mkdir(parents=True, exist_ok=True)
     if profile is not None:
@@ -484,7 +624,12 @@ def _refresh_slot(name: str) -> str | None:
     if usage is not None:
         usage["_fetched_at"] = datetime.now(timezone.utc).isoformat()
         (d / "usage.json").write_text(json.dumps(usage, indent=2))
-    return err
+    # a failed refresh is the root cause of any subsequent 401 — surface that
+    # (e.g. "invalid_grant" when the refresh token was revoked) instead of the
+    # downstream symptom.
+    if refresh_err and err and "401" in err:
+        return f"{refresh_err} (re-login required: `claude` then `cc-auth save {name}`)"
+    return err or refresh_err
 
 
 def _usage_is_fresh(usage: dict | None, max_age_s: int = LIST_REFRESH_MAX_AGE_S) -> bool:
@@ -587,8 +732,12 @@ def cmd_stats(name: str | None) -> None:
         opus = usage.get("seven_day_opus") or {}
         sonn = usage.get("seven_day_sonnet") or {}
 
-        print(row("5 hour", fh.get("utilization"), fh.get("resets_at")))
-        print(row("7 day",  sd.get("utilization"), sd.get("resets_at")))
+        sd_pct = sd.get("utilization")
+        fh_pct = fh.get("utilization")
+        if isinstance(sd_pct, (int, float)) and sd_pct >= 100:
+            fh_pct = 100
+        print(row("5 hour", fh_pct, fh.get("resets_at")))
+        print(row("7 day",  sd_pct, sd.get("resets_at")))
         if opus:
             print(row("  opus",   opus.get("utilization"), opus.get("resets_at")))
         if sonn:
@@ -634,8 +783,12 @@ def cmd_whoami() -> None:
                     f"{_c(LABEL, 'resets', force=color)} "
                     f"{color_reset_hint(resets, force_color=color)}")
         print()
-        print(row("5 hour", fh.get("utilization"), fh.get("resets_at")))
-        print(row("7 day",  sd.get("utilization"), sd.get("resets_at")))
+        sd_pct = sd.get("utilization")
+        fh_pct = fh.get("utilization")
+        if isinstance(sd_pct, (int, float)) and sd_pct >= 100:
+            fh_pct = 100
+        print(row("5 hour", fh_pct, fh.get("resets_at")))
+        print(row("7 day",  sd_pct, sd.get("resets_at")))
 
 
 # ─── main ──────────────────────────────────────────────────────────────────
