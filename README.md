@@ -2,7 +2,7 @@
 
 `cc-auth` — save, switch, and inspect multiple Claude Code authentication slots.
 
-If you use more than one Claude account (personal/work, multiple Max plans, a shared org login), Claude Code only ever sees one set of credentials at a time. `cc-auth` snapshots those credentials into named slots and lets you swap between them, while caching each account's profile and rate-limit usage so you can see — at a glance — which account has headroom left.
+If you use more than one Claude account (personal/work, multiple Max plans), Claude Code only ever sees one set of credentials at a time. `cc-auth` snapshots those credentials into named slots and lets you swap between them, while caching each account's profile and rate-limit usage so you can see — at a glance — which account has headroom left.
 
 ![cc-auth list example](docs/cc-auth-list-example.png)
 
