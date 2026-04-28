@@ -1080,26 +1080,34 @@ def _check_for_update(*, force: bool = False) -> str | None:
     return None
 
 
-def _print_update_hint() -> None:
+def _print_update_hint(*, when_current: bool = False) -> None:
+    """Print the one-line update hint to stderr if a newer version exists.
+
+    Stays silent when already on the latest version unless when_current is set
+    (used by `cc-auth version`, where "up to date" is the affirmative answer).
+    """
     try:
         latest = _check_for_update()
     except Exception:
         return
-    if not latest:
-        return
     color = _color_enabled(sys.stderr)
-    line = (f"  update available: {__version__} → {latest}  "
-            f"(https://github.com/{GITHUB_REPO}/releases)")
-    print(_c(AMBER, line, force=color), file=sys.stderr)
+    if latest:
+        line = (f"  update available: {__version__} → {latest}  "
+                f"(https://github.com/{GITHUB_REPO}/releases)")
+        print(_c(AMBER, line, force=color), file=sys.stderr)
+    elif when_current:
+        print(_c(DIM, "  up to date", force=color), file=sys.stderr)
 
 
 def cmd_version() -> None:
-    print(f"cc-auth {__version__}")
-    latest = _check_for_update(force=True)
-    if latest:
-        print(f"latest:  {latest}  (https://github.com/{GITHUB_REPO}/releases)")
-    else:
-        print("up to date")
+    # force the network check (bypassing the 24h cache) so an explicit
+    # `cc-auth version` always reflects the live remote state. the hint
+    # itself is printed by main() via UPDATE_HINT_CMDS.
+    print(f"cc-auth {__version__}", flush=True)
+    try:
+        _check_for_update(force=True)
+    except Exception:
+        pass
 
 
 # ─── main ──────────────────────────────────────────────────────────────────
@@ -1117,7 +1125,7 @@ COMMANDS = {
     "version": (cmd_version, 0),
 }
 
-UPDATE_HINT_CMDS = {"list", "current", "whoami"}
+UPDATE_HINT_CMDS = {"list", "current", "whoami", "save", "ping", "version"}
 
 
 def migrate_legacy_home() -> None:
@@ -1179,7 +1187,7 @@ def main() -> None:
         fn(*args)
 
     if cmd in UPDATE_HINT_CMDS:
-        _print_update_hint()
+        _print_update_hint(when_current=(cmd == "version"))
 
 
 if __name__ == "__main__":
