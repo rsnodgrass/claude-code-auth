@@ -22,6 +22,7 @@ Usage:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -41,6 +42,10 @@ SLOT_KEYCHAIN_SERVICE = "cc-auth"
 CC_HOME = Path.home() / ".claude" / "cc-auth"
 SLOTS_DIR = CC_HOME / "slots"
 LEGACY_CC_HOME = Path.home() / ".cc-auth"  # pre-move location; migrated on first run
+# memo: access-token hash → account email. avoids re-fetching /oauth/profile on
+# every cc-auth invocation just to identify whose creds are active. invalidated
+# automatically whenever the active accessToken rotates (the hash changes).
+ACTIVE_IDENTITY_CACHE = CC_HOME / "active-identity.json"
 
 API_BASE = "https://api.anthropic.com"
 OAUTH_BETA = "oauth-2025-04-20"
@@ -398,18 +403,103 @@ def slot_tier(name: str) -> str:
     return ""
 
 
-def find_current_slot() -> str | None:
+def _token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def _load_identity_cache() -> dict:
+    return load_json(ACTIVE_IDENTITY_CACHE) or {}
+
+
+def _save_identity_cache(cache: dict) -> None:
+    ACTIVE_IDENTITY_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    ACTIVE_IDENTITY_CACHE.write_text(json.dumps(cache, indent=2))
+
+
+def identify_active_email(blob: str | None = None) -> str | None:
+    """Return the email of the active credentials, using a fingerprint cache.
+
+    Falls back to /api/oauth/profile on cache miss; result is memoized keyed on
+    the access-token fingerprint so rotations naturally invalidate the entry.
+    """
+    if blob is None:
+        blob = read_active_credentials()
+    if not blob:
+        return None
+    token = extract_access_token(blob)
+    if not token:
+        return None
+    fp = _token_fingerprint(token)
+    cache = _load_identity_cache()
+    if fp in cache:
+        return cache[fp] or None
+    profile, _usage, err = fetch_profile_and_usage(token)
+    email: str | None = None
+    if profile:
+        email = profile.get("account", {}).get("email") or None
+    if email:
+        # prune to keep the cache from growing unbounded; we only ever need the
+        # most recent fingerprint for the active identity flow.
+        cache = {fp: email}
+        _save_identity_cache(cache)
+    return email
+
+
+def _slot_match_by_token(token: str) -> str | None:
+    for name in list_slot_names():
+        blob = slot_creds_read(name)
+        if blob and extract_access_token(blob) == token:
+            return name
+    return None
+
+
+def _slot_match_by_email(email: str) -> str | None:
+    for name in list_slot_names():
+        if slot_email(name).lower() == email.lower():
+            return name
+    return None
+
+
+def sync_active_to_slot(*, verbose: bool = True) -> str | None:
+    """Reconcile the active credentials with whichever slot they belong to.
+
+    Refresh-token rotation means `claude` (or any other tool) can rotate the
+    active blob's accessToken/refreshToken pair without cc-auth's knowledge,
+    leaving the originating slot pointing at a now-revoked refresh token. This
+    finds the owning slot by stable identity (account email cached in
+    profile.json) and overwrites the slot's stored blob with the active one,
+    self-healing the rotation drift before any refresh is attempted.
+
+    Returns the matched slot name (or None). Quiet when the slot was already in
+    sync; logs a one-line stderr note when a write actually happens.
+    """
     active = read_active_credentials()
     if not active:
         return None
-    active_tok = extract_access_token(active)
-    if not active_tok:
+    token = extract_access_token(active)
+    if not token:
         return None
-    for name in list_slot_names():
-        blob = slot_creds_read(name)
-        if blob and extract_access_token(blob) == active_tok:
-            return name
-    return None
+    # cheap path: accessToken still matches a slot exactly → nothing to do.
+    n = _slot_match_by_token(token)
+    if n is not None:
+        return n
+    # drifted: identify the active account and rewrite the matching slot.
+    email = identify_active_email(active)
+    if not email:
+        return None
+    n = _slot_match_by_email(email)
+    if n is None:
+        return None
+    slot_creds_write(n, active)
+    if verbose:
+        print(_c(DIM, f"synced rotated credentials → slot {n}"),
+              file=sys.stderr, flush=True)
+    return n
+
+
+def find_current_slot() -> str | None:
+    """Name of the slot matching the active credentials, syncing on drift."""
+    return sync_active_to_slot(verbose=True)
 
 
 # ─── commands ──────────────────────────────────────────────────────────────
@@ -825,6 +915,9 @@ def migrate_legacy_home() -> None:
     print(f"migrated {LEGACY_CC_HOME} → {CC_HOME}", file=sys.stderr)
 
 
+SYNC_BEFORE_CMDS = {"list", "current", "refresh", "stats", "switch", "whoami"}
+
+
 def main() -> None:
     migrate_legacy_home()
     SLOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -836,6 +929,14 @@ def main() -> None:
     args = argv[1:]
     if cmd not in COMMANDS:
         die(f"Unknown command: {cmd}\n\n{__doc__}")
+    # heal rotation drift before any read/refresh that depends on slot blobs.
+    # `save` and `delete` intentionally skip — save explicitly captures the
+    # active blob and delete shouldn't trigger a network call.
+    if cmd in SYNC_BEFORE_CMDS:
+        try:
+            sync_active_to_slot(verbose=True)
+        except Exception as e:
+            print(_c(DIM, f"(sync skipped: {e})"), file=sys.stderr)
     fn, arity = COMMANDS[cmd]
     if arity == 0:
         if args:
