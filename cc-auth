@@ -19,6 +19,10 @@ Usage:
   cc-auth refresh [<name>] [--force]
                               re-fetch profile+usage for one slot (or all);
                               skips slots with fresh cached usage unless --force
+  cc-auth ping [<name>]       send a near-zero-cost `claude -p hi` to start
+                              the slot's 5h/7d session windows (uses real
+                              claude CLI; isolated CLAUDE_CONFIG_DIR so the
+                              user's main session is untouched)
   cc-auth stats [<name>]      table of cached usage per slot (or one)
   cc-auth whoami              active account email+tier (from fresh profile call)
 """
@@ -61,6 +65,11 @@ USER_AGENT = "cc-auth/1.0"
 
 # refresh proactively if the token expires within this many seconds
 REFRESH_SKEW_S = 60
+
+# ping uses the cheapest available model + max_tokens=1 to start the rolling
+# 5h/7d rate-limit windows with the smallest possible quota draw.
+PING_MODEL = "claude-haiku-4-5"
+PING_PROMPT = "hi"
 
 
 # ─── color + visual helpers (Tufte-ish: muted palette, data-ink ratio) ─────
@@ -216,6 +225,8 @@ def api_get(path: str, token: str) -> dict:
     )
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())
+
+
 
 
 def refresh_blob(blob: str) -> tuple[str | None, str | None]:
@@ -550,7 +561,15 @@ def _slot_picker_line(n: str, current: str | None, *, color: bool = False) -> st
         or not fh.get("resets_at")
     )
     reset_iso = sd.get("resets_at") if binding_is_sd else fh.get("resets_at")
-    reset_s = color_reset_hint(reset_iso, force_color=color)
+    # if the slot's stored access token is expired and we couldn't refresh it,
+    # the cached usage (and any `resets_at`) is frozen at the last successful
+    # poll — rendering "expired" against that frozen timestamp is misleading,
+    # so flag the slot as stale instead and prompt for re-login.
+    blob = slot_creds_read(n)
+    if blob and token_is_expired(blob, skew_s=0):
+        reset_s = _c(BRICK, "stale", force=color) + _c(DIM, " (re-login)", force=color)
+    else:
+        reset_s = color_reset_hint(reset_iso, force_color=color)
 
     lbl_5h = _c(LABEL, "5h", force=color) if color else "5h"
     lbl_7d = _c(LABEL, "7d", force=color) if color else "7d"
@@ -787,6 +806,84 @@ def cmd_refresh(*args: str) -> None:
         print(f"{n}: {status}")
 
 
+def cmd_ping(name: str | None) -> None:
+    """Send a near-zero-cost message via `claude -p` to start the 5h/7d windows.
+
+    Drives the real `claude` CLI rather than calling /v1/messages directly, so
+    the request is indistinguishable from any other Claude Code traffic
+    (correct system prompt, user agent, request shape). The slot's OAuth
+    access token is passed via the CLAUDE_CODE_OAUTH_TOKEN env var, and a
+    fresh CLAUDE_CONFIG_DIR keeps the user's main ~/.claude untouched (no
+    history pollution, no MCP/agent re-init, no keychain swap).
+    """
+    if not shutil.which("claude"):
+        die("ping: `claude` CLI not found on PATH")
+
+    if name:
+        blob = slot_creds_read(name)
+        if blob is None:
+            die(f"No such slot: {name}")
+        blob, err = _maybe_refresh_credentials(name, blob)
+        if err and token_is_expired(blob):
+            die(f"refresh: {err}")
+        target = name
+    else:
+        target = find_current_slot()
+        blob = read_active_credentials()
+        if not blob:
+            die("No active credentials.")
+        if token_is_expired(blob):
+            new_blob, err = refresh_blob(blob)
+            if new_blob:
+                write_active_credentials(new_blob)
+                if target:
+                    slot_creds_write(target, new_blob)
+                blob = new_blob
+            elif err:
+                die(f"refresh: {err}")
+
+    token = extract_access_token(blob)
+    if not token:
+        die("ping: no access token available")
+
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix="cc-auth-ping-")
+    env = {**os.environ, "CLAUDE_CONFIG_DIR": tmpdir, "CLAUDE_CODE_OAUTH_TOKEN": token}
+    # subscription type isn't strictly required, but Claude Code reads it from
+    # the env when present and skips a profile lookup that's redundant for us.
+    try:
+        sub = json.loads(blob).get("claudeAiOauth", {}).get("subscriptionType")
+        if sub:
+            env["CLAUDE_CODE_SUBSCRIPTION_TYPE"] = sub
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    label = target or "(active)"
+    print(f"ping {label}: sending via `claude -p`…", flush=True)
+    try:
+        r = subprocess.run(
+            ["claude", "--print", "--model", PING_MODEL,
+             "--no-session-persistence", PING_PROMPT],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        die("ping: claude -p timed out after 60s")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if r.returncode != 0:
+        err_tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
+        die(f"ping: claude exit {r.returncode}\n  " + "\n  ".join(err_tail))
+
+    reply = (r.stdout or "").strip().splitlines()[0:1]
+    print(f"ping {label}: ok ({reply[0][:80] if reply else 'no output'})")
+    if target:
+        rerr = _refresh_slot(target)
+        if rerr:
+            print(f"  warning: {rerr}", file=sys.stderr)
+
+
 def _fmt_util(block: dict | None) -> str:
     if not block:
         return "-"
@@ -911,6 +1008,7 @@ COMMANDS = {
     "current": (cmd_current, 0),
     "delete": (cmd_delete, 1),
     "refresh": (cmd_refresh, "*"),
+    "ping": (cmd_ping, "0-1"),
     "stats": (cmd_stats, "0-1"),
     "whoami": (cmd_whoami, 0),
 }
@@ -936,7 +1034,7 @@ def migrate_legacy_home() -> None:
     print(f"migrated {LEGACY_CC_HOME} → {CC_HOME}", file=sys.stderr)
 
 
-SYNC_BEFORE_CMDS = {"list", "current", "refresh", "stats", "switch", "whoami"}
+SYNC_BEFORE_CMDS = {"list", "current", "refresh", "stats", "switch", "whoami", "ping"}
 
 
 def main() -> None:
