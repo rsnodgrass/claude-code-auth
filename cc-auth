@@ -25,6 +25,9 @@ Usage:
                               user's main session is untouched)
   cc-auth stats [<name>]      table of cached usage per slot (or one)
   cc-auth whoami              active account email+tier (from fresh profile call)
+  cc-auth version             show installed version + check GitHub for newer
+
+Set CC_AUTH_NO_UPDATE_CHECK=1 to disable the daily update check.
 """
 from __future__ import annotations
 
@@ -39,6 +42,9 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+__version__ = "0.2.0"
+GITHUB_REPO = "rsnodgrass/claude-code-auth"
+
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 KEYCHAIN_ACCOUNT = os.environ.get("USER", "")
 LINUX_CREDS_FILE = Path.home() / ".claude" / ".credentials.json"
@@ -52,6 +58,9 @@ LEGACY_CC_HOME = Path.home() / ".cc-auth"  # pre-move location; migrated on firs
 # every cc-auth invocation just to identify whose creds are active. invalidated
 # automatically whenever the active accessToken rotates (the hash changes).
 ACTIVE_IDENTITY_CACHE = CC_HOME / "active-identity.json"
+
+UPDATE_CHECK_FILE = CC_HOME / "update-check.json"
+UPDATE_CHECK_TTL_S = 24 * 3600  # one network call per day, max
 
 API_BASE = "https://api.anthropic.com"
 OAUTH_BETA = "oauth-2025-04-20"
@@ -999,6 +1008,100 @@ def cmd_whoami() -> None:
         print(row("7 day",  sd_pct, sd.get("resets_at")))
 
 
+# ─── update check ──────────────────────────────────────────────────────────
+
+def _parse_version(s: str) -> tuple[int, ...]:
+    """Loose semver parse — leading 'v' tolerated, non-numeric components → 0."""
+    out: list[int] = []
+    for part in s.lstrip("v").split("."):
+        # strip pre-release/build suffix on the first non-digit run, e.g. "0.2.0-rc1"
+        digits = ""
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        out.append(int(digits) if digits else 0)
+    return tuple(out) or (0,)
+
+
+def _check_for_update(*, force: bool = False) -> str | None:
+    """Return latest published version if newer than __version__, else None.
+
+    Caches the network check for UPDATE_CHECK_TTL_S so daily users pay one
+    GitHub API call per day. Tries Releases first (the curated artifact);
+    falls back to Tags so a single `git tag vX.Y.Z && git push --tags` is
+    enough to make a new version visible without cutting a Release.
+    """
+    if os.environ.get("CC_AUTH_NO_UPDATE_CHECK"):
+        return None
+    cache = load_json(UPDATE_CHECK_FILE) or {}
+    now = datetime.now(timezone.utc)
+    if not force and cache.get("checked_at"):
+        try:
+            checked = datetime.fromisoformat(cache["checked_at"].replace("Z", "+00:00"))
+            if (now - checked).total_seconds() < UPDATE_CHECK_TTL_S:
+                latest = cache.get("latest")
+                if latest and _parse_version(latest) > _parse_version(__version__):
+                    return latest.lstrip("v")
+                return None
+        except ValueError:
+            pass
+
+    headers = {"User-Agent": f"cc-auth/{__version__}",
+               "Accept": "application/vnd.github+json"}
+    latest: str | None = None
+    for path in (f"/repos/{GITHUB_REPO}/releases/latest",
+                 f"/repos/{GITHUB_REPO}/tags"):
+        try:
+            req = urllib.request.Request(f"https://api.github.com{path}", headers=headers)
+            with urllib.request.urlopen(req, timeout=3) as r:
+                data = json.loads(r.read())
+            if isinstance(data, dict):
+                latest = data.get("tag_name")
+            elif isinstance(data, list) and data:
+                latest = data[0].get("name")
+            if latest:
+                break
+        except Exception:
+            continue
+
+    cache["checked_at"] = now.isoformat()
+    if latest:
+        cache["latest"] = latest
+    try:
+        UPDATE_CHECK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        UPDATE_CHECK_FILE.write_text(json.dumps(cache))
+    except OSError:
+        pass
+
+    if latest and _parse_version(latest) > _parse_version(__version__):
+        return latest.lstrip("v")
+    return None
+
+
+def _print_update_hint() -> None:
+    try:
+        latest = _check_for_update()
+    except Exception:
+        return
+    if not latest:
+        return
+    color = _color_enabled(sys.stderr)
+    line = (f"  update available: {__version__} → {latest}  "
+            f"(https://github.com/{GITHUB_REPO}/releases)")
+    print(_c(AMBER, line, force=color), file=sys.stderr)
+
+
+def cmd_version() -> None:
+    print(f"cc-auth {__version__}")
+    latest = _check_for_update(force=True)
+    if latest:
+        print(f"latest:  {latest}  (https://github.com/{GITHUB_REPO}/releases)")
+    else:
+        print("up to date")
+
+
 # ─── main ──────────────────────────────────────────────────────────────────
 
 COMMANDS = {
@@ -1011,7 +1114,10 @@ COMMANDS = {
     "ping": (cmd_ping, "0-1"),
     "stats": (cmd_stats, "0-1"),
     "whoami": (cmd_whoami, 0),
+    "version": (cmd_version, 0),
 }
+
+UPDATE_HINT_CMDS = {"list", "current", "whoami"}
 
 
 def migrate_legacy_home() -> None:
@@ -1071,6 +1177,9 @@ def main() -> None:
         fn(args[0] if args else None)
     elif arity == "*":
         fn(*args)
+
+    if cmd in UPDATE_HINT_CMDS:
+        _print_update_hint()
 
 
 if __name__ == "__main__":
