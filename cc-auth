@@ -16,7 +16,9 @@ Usage:
   cc-auth list                list slots with cached email + tier
   cc-auth current             name of the slot matching active credentials (if any)
   cc-auth delete <name>       remove a slot
-  cc-auth refresh [<name>]    re-fetch profile+usage for one slot (or all)
+  cc-auth refresh [<name>] [--force]
+                              re-fetch profile+usage for one slot (or all);
+                              skips slots with fresh cached usage unless --force
   cc-auth stats [<name>]      table of cached usage per slot (or one)
   cc-auth whoami              active account email+tier (from fresh profile call)
 """
@@ -756,11 +758,30 @@ def _usage_is_fresh(usage: dict | None, max_age_s: int = LIST_REFRESH_MAX_AGE_S)
     return False
 
 
-def cmd_refresh(name: str | None) -> None:
+def cmd_refresh(*args: str) -> None:
+    # default skips slots whose cached usage is still inside the freshness
+    # window (or saturated with a future reset, where re-polling can't change
+    # anything). --force ignores the cache and always re-polls.
+    force = False
+    name: str | None = None
+    for a in args:
+        if a == "--force":
+            force = True
+        elif a == "--if-stale":
+            pass  # accepted for back-compat; this is now the default
+        elif a.startswith("--"):
+            die(f"refresh: unknown flag {a}")
+        elif name is None:
+            name = a
+        else:
+            die("refresh: too many positional arguments")
     names = [name] if name else list_slot_names()
     if not names:
         die("No slots to refresh.")
     for n in names:
+        if not force and _usage_is_fresh(load_json(slot_dir(n) / "usage.json")):
+            print(f"{n}: skip (fresh)")
+            continue
         err = _refresh_slot(n)
         status = "ok" if err is None else f"WARN {err}"
         print(f"{n}: {status}")
@@ -889,7 +910,7 @@ COMMANDS = {
     "list": (cmd_list, 0),
     "current": (cmd_current, 0),
     "delete": (cmd_delete, 1),
-    "refresh": (cmd_refresh, "0-1"),
+    "refresh": (cmd_refresh, "*"),
     "stats": (cmd_stats, "0-1"),
     "whoami": (cmd_whoami, 0),
 }
@@ -950,6 +971,8 @@ def main() -> None:
         if len(args) > 1:
             die(f"{cmd} takes at most one argument")
         fn(args[0] if args else None)
+    elif arity == "*":
+        fn(*args)
 
 
 if __name__ == "__main__":
