@@ -635,7 +635,16 @@ def cmd_switch(name: str | None) -> None:
     blob = slot_creds_read(name)
     if blob is None:
         die(f"No such slot: {name}")
+    blob, refresh_err = _maybe_refresh_credentials(name, blob)
+    if refresh_err:
+        if token_is_expired(blob):
+            die(f"slot {name}: credentials expired and refresh failed: {refresh_err}\n"
+                f"  re-login: `claude` then `cc-auth save {name}`")
+        print(_c(DIM, f"  warning: {refresh_err}"), file=sys.stderr)
     write_active_credentials(blob)
+    err = _refresh_slot(name)
+    if err:
+        print(_c(DIM, f"  warning: {err}"), file=sys.stderr)
     print(f"Switched to slot: {name}  ({slot_email(name) or 'email unknown'})")
     print("Restart Claude Code sessions to pick up the change.")
 
