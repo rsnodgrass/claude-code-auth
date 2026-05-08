@@ -42,7 +42,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 GITHUB_REPO = "rsnodgrass/claude-code-auth"
 
 KEYCHAIN_SERVICE = "Claude Code-credentials"
@@ -627,6 +627,11 @@ def pick_slot_interactively() -> str | None:
 
 
 def cmd_switch(name: str | None) -> None:
+    names = list_slot_names()
+    if not names:
+        die("No slots saved.")
+    # force-refresh all slots so the picker (and any named slot) shows live data
+    _refresh_stale_slots(names, force=True)
     if not name:
         name = pick_slot_interactively()
         if not name:
@@ -642,9 +647,6 @@ def cmd_switch(name: str | None) -> None:
                 f"  re-login: `claude` then `cc-auth save {name}`")
         print(_c(DIM, f"  warning: {refresh_err}"), file=sys.stderr)
     write_active_credentials(blob)
-    err = _refresh_slot(name)
-    if err:
-        print(_c(DIM, f"  warning: {err}"), file=sys.stderr)
     print(f"Switched to slot: {name}  ({slot_email(name) or 'email unknown'})")
     print("Restart Claude Code sessions to pick up the change.")
 
@@ -654,15 +656,7 @@ def cmd_list() -> None:
     if not names:
         print(_c(DIM, "(no slots saved)"))
         return
-    stale = [n for n in names
-             if not _usage_is_fresh(load_json(slot_dir(n) / "usage.json"))]
-    if stale:
-        msg = f"refreshing {len(stale)} slot{'s' if len(stale) != 1 else ''}…"
-        print(_c(DIM, msg), file=sys.stderr, flush=True)
-        for n in stale:
-            err = _refresh_slot(n)
-            if err:
-                print(_c(DIM, f"  {n}: {err}"), file=sys.stderr)
+    _refresh_stale_slots(names)
     current = find_current_slot()
     for n in names:
         print(_slot_picker_line(n, current, color=_color_enabled()))
@@ -687,6 +681,22 @@ def cmd_delete(name: str) -> None:
 
 
 LIST_REFRESH_MAX_AGE_S = 15 * 60
+
+
+def _refresh_stale_slots(names: list[str], *, force: bool = False) -> None:
+    """Refresh slots with stale usage data. If force, refresh all regardless."""
+    targets = names if force else [
+        n for n in names
+        if not _usage_is_fresh(load_json(slot_dir(n) / "usage.json"))
+    ]
+    if not targets:
+        return
+    msg = f"refreshing {len(targets)} slot{'s' if len(targets) != 1 else ''}…"
+    print(_c(DIM, msg), file=sys.stderr, flush=True)
+    for n in targets:
+        err = _refresh_slot(n)
+        if err:
+            print(_c(DIM, f"  {n}: {err}"), file=sys.stderr)
 
 
 def _maybe_refresh_credentials(name: str, blob: str) -> tuple[str, str | None]:
